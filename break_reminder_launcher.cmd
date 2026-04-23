@@ -1,0 +1,1 @@
+powershell.exe -ExecutionPolicy Bypass -Command "Start-Process powershell.exe -ArgumentList '-ExecutionPolicy Bypass -WindowStyle Hidden -File \"%~dp0break_reminder.ps1\"' -WindowStyle Hidden"
