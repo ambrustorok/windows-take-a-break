@@ -9,24 +9,46 @@ $borderThickness    = 25    # Thickness of the flash border in pixels
 $flashColor         = [System.Drawing.Color]::Red  # Flash color
 # =========================================================
 
-# System tray icon to allow stopping the script
+# Track when the next break is due
+$script:nextBreakTime = (Get-Date).AddMinutes($breakEveryMinutes)
+
+# System tray icon
 $trayIcon = New-Object System.Windows.Forms.NotifyIcon
 $trayIcon.Icon    = [System.Drawing.SystemIcons]::Information
-$trayIcon.Text    = "Break Reminder"
 $trayIcon.Visible = $true
 
 $contextMenu = New-Object System.Windows.Forms.ContextMenuStrip
+
+$breakTakenItem = $contextMenu.Items.Add("I just took a break")
+$breakTakenItem.Font = New-Object System.Drawing.Font("Segoe UI", 9, [System.Drawing.FontStyle]::Bold)
+$breakTakenItem.Add_Click({
+    $script:nextBreakTime = (Get-Date).AddMinutes($breakEveryMinutes)
+    $trayIcon.ShowBalloonTip(2000, "Break Reminder", "Timer reset. Next break in $breakEveryMinutes min.", [System.Windows.Forms.ToolTipIcon]::Info)
+})
+
+$contextMenu.Items.Add("-")  # separator
+
 $stopItem = $contextMenu.Items.Add("Stop Reminders")
 $stopItem.Add_Click({
     $trayIcon.Visible = $false
     $trayIcon.Dispose()
     [System.Environment]::Exit(0)
 })
+
 $trayIcon.ContextMenuStrip = $contextMenu
+
+function Update-TrayTooltip {
+    $remaining = $script:nextBreakTime - (Get-Date)
+    if ($remaining.TotalSeconds -lt 0) { $remaining = [TimeSpan]::Zero }
+    $minLeft  = [math]::Floor($remaining.TotalMinutes)
+    $secLeft  = $remaining.Seconds
+    $timeStr  = $script:nextBreakTime.ToString("HH:mm")
+    # NotifyIcon.Text has a 63-char limit
+    $trayIcon.Text = "Break at $timeStr ($minLeft min $secLeft sec left)"
+}
 
 function Flash-Screen {
     $forms = @()
-
     foreach ($screen in [System.Windows.Forms.Screen]::AllScreens) {
         $form = New-Object System.Windows.Forms.Form
         $form.FormBorderStyle = 'None'
@@ -50,7 +72,6 @@ function Flash-Screen {
             $g.DrawRectangle($pen, $rect)
             $pen.Dispose()
         })
-
         $form.Show()
         $forms += $form
     }
@@ -61,12 +82,11 @@ function Flash-Screen {
         foreach ($f in $forms) { $f.Opacity = 0.0; $f.Refresh() }
         Start-Sleep -Milliseconds 200
     }
-
     foreach ($f in $forms) { $f.Close(); $f.Dispose() }
 }
 
 function Show-BreakDialog {
-    param([int]$minutesUntilNext)
+    param([int]$minutesWorked)
 
     $dialog = New-Object System.Windows.Forms.Form
     $dialog.Text            = "Break Reminder"
@@ -78,7 +98,7 @@ function Show-BreakDialog {
     $dialog.MinimizeBox     = $false
 
     $label = New-Object System.Windows.Forms.Label
-    $label.Text      = "Time for a break!`nYou've been working for $minutesUntilNext minutes."
+    $label.Text      = "Time for a break!`nYou've been working for $minutesWorked minutes."
     $label.Location  = New-Object System.Drawing.Point(20, 15)
     $label.Size      = New-Object System.Drawing.Size(320, 40)
     $label.Font      = New-Object System.Drawing.Font("Segoe UI", 10)
@@ -101,41 +121,36 @@ function Show-BreakDialog {
     $btn10.Size     = New-Object System.Drawing.Size(105, 35)
     $btn10.Font     = New-Object System.Drawing.Font("Segoe UI", 9)
 
-    $result = "break"
-    $btnBreak.Add_Click({ $script:result = "break";    $dialog.Close() })
-    $btn5.Add_Click({     $script:result = "snooze5";  $dialog.Close() })
-    $btn10.Add_Click({    $script:result = "snooze10"; $dialog.Close() })
+    $script:dialogResult = "break"
+    $btnBreak.Add_Click({ $script:dialogResult = "break";    $dialog.Close() })
+    $btn5.Add_Click({     $script:dialogResult = "snooze5";  $dialog.Close() })
+    $btn10.Add_Click({    $script:dialogResult = "snooze10"; $dialog.Close() })
 
     $dialog.Controls.AddRange(@($label, $btnBreak, $btn5, $btn10))
     $dialog.ShowDialog() | Out-Null
-
-    return $script:result
+    return $script:dialogResult
 }
 
 # ===================== MAIN LOOP =====================
-$nextReminderMinutes = $breakEveryMinutes
 $script:shouldStop = $false
 
 while (-not $script:shouldStop) {
-    # Sleep in small chunks so we can respond to the stop flag quickly
-    $totalSeconds = $nextReminderMinutes * 60
-    $elapsed = 0
-    while ($elapsed -lt $totalSeconds -and -not $script:shouldStop) {
+    # Sleep in 1-second chunks, updating tooltip each tick
+    while ((Get-Date) -lt $script:nextBreakTime -and -not $script:shouldStop) {
         Start-Sleep -Seconds 1
-        $elapsed++
-        [System.Windows.Forms.Application]::DoEvents()  # keeps tray icon responsive
+        Update-TrayTooltip
+        [System.Windows.Forms.Application]::DoEvents()
     }
 
     if ($script:shouldStop) { break }
 
     Flash-Screen
-
-    $response = Show-BreakDialog -minutesUntilNext $breakEveryMinutes
+    $response = Show-BreakDialog -minutesWorked $breakEveryMinutes
 
     switch ($response) {
-        "break"    { $nextReminderMinutes = $breakEveryMinutes }
-        "snooze5"  { $nextReminderMinutes = 5  }
-        "snooze10" { $nextReminderMinutes = 10 }
+        "break"    { $script:nextBreakTime = (Get-Date).AddMinutes($breakEveryMinutes) }
+        "snooze5"  { $script:nextBreakTime = (Get-Date).AddMinutes(5)  }
+        "snooze10" { $script:nextBreakTime = (Get-Date).AddMinutes(10) }
     }
 }
 
