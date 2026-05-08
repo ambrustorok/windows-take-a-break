@@ -24,9 +24,11 @@ function Write-BreakLog {
 # Track state
 $script:sessionStart        = Get-Date
 $script:totalBreakSeconds   = 0
+$script:totalMeetingSeconds = 0
 $script:nextBreakTime       = (Get-Date).AddMinutes($breakEveryMinutes)
 $script:snoozeStreak        = 0
 $script:shouldStop          = $false
+$script:lockTime            = $null
 
 # -- Helper: format a TimeSpan as "Xh Ym" --
 function Format-Duration {
@@ -35,6 +37,206 @@ function Format-Duration {
     $m = $ts.Minutes
     if ($h -gt 0) { return "{0}h {1}m" -f $h, $m }
     return "{0}m" -f $m
+}
+
+# ===================== SESSION LOCK/UNLOCK HOOK =====================
+$sessionSwitchHandler = [Microsoft.Win32.SessionSwitchEventHandler]{
+    param($sender, $e)
+    switch ($e.Reason) {
+        'SessionLock' {
+            $script:lockTime = Get-Date
+            Write-BreakLog "screen_locked" ""
+        }
+        'SessionUnlock' {
+            if ($script:lockTime) {
+                $unlockTime  = Get-Date
+                $awaySeconds = ($unlockTime - $script:lockTime).TotalSeconds
+                $awayMins    = [math]::Round($awaySeconds / 60, 1)
+                $lockTimeStr = $script:lockTime.ToString("HH:mm")
+                Write-BreakLog "screen_unlocked" "Away $awayMins min (locked at $lockTimeStr)"
+
+                # Only ask if away for more than 1 minute
+                if ($awaySeconds -ge 60) {
+                    $result = Show-AwayDialog -LockTime $script:lockTime -UnlockTime $unlockTime
+                    switch ($result.Choice) {
+                        "break" {
+                            $script:totalBreakSeconds += $awaySeconds
+                            $script:nextBreakTime = (Get-Date).AddMinutes($breakEveryMinutes)
+                            $script:snoozeStreak  = 0
+                            Write-BreakLog "away_break" "Full away time counted as break: $awayMins min"
+                            $trayIcon.ShowBalloonTip(2000, "Break Reminder",
+                                "Welcome back! $awayMins min counted as break. Next break in $breakEveryMinutes min.",
+                                [System.Windows.Forms.ToolTipIcon]::Info)
+                        }
+                        "meeting" {
+                            $script:totalMeetingSeconds += $awaySeconds
+                            # Don't reset break timer — they still need a break
+                            Write-BreakLog "away_meeting" "Away time counted as meeting: $awayMins min"
+                            $trayIcon.ShowBalloonTip(2000, "Break Reminder",
+                                "Welcome back! $awayMins min counted as meeting.",
+                                [System.Windows.Forms.ToolTipIcon]::Info)
+                        }
+                        "both" {
+                            $breakSec   = $result.BreakMinutes * 60
+                            $meetingSec = $awaySeconds - $breakSec
+                            if ($meetingSec -lt 0) { $meetingSec = 0 }
+                            $script:totalBreakSeconds   += $breakSec
+                            $script:totalMeetingSeconds += $meetingSec
+                            $script:nextBreakTime = (Get-Date).AddMinutes($breakEveryMinutes)
+                            $script:snoozeStreak  = 0
+                            Write-BreakLog "away_both" ("Break: {0} min, Meeting: {1} min" -f
+                                [math]::Round($breakSec/60,1), [math]::Round($meetingSec/60,1))
+                            $trayIcon.ShowBalloonTip(2000, "Break Reminder",
+                                "Welcome back! Split recorded. Next break in $breakEveryMinutes min.",
+                                [System.Windows.Forms.ToolTipIcon]::Info)
+                        }
+                        "ignore" {
+                            Write-BreakLog "away_ignored" "Away $awayMins min - user chose to ignore"
+                        }
+                    }
+                }
+                $script:lockTime = $null
+            }
+        }
+    }
+}
+
+[Microsoft.Win32.SystemEvents]::add_SessionSwitch($sessionSwitchHandler)
+
+# ===================== AWAY DIALOG =====================
+function Show-AwayDialog {
+    param(
+        [DateTime]$LockTime,
+        [DateTime]$UnlockTime
+    )
+
+    $awaySpan  = $UnlockTime - $LockTime
+    $awayMins  = [math]::Round($awaySpan.TotalMinutes, 1)
+    $awaySecs  = [math]::Round($awaySpan.TotalSeconds)
+    $lockStr   = $LockTime.ToString("HH:mm")
+    $unlockStr = $UnlockTime.ToString("HH:mm")
+
+    $dialog = New-Object System.Windows.Forms.Form
+    $dialog.Text            = "Welcome Back"
+    $dialog.Size            = New-Object System.Drawing.Size(430, 280)
+    $dialog.StartPosition   = 'CenterScreen'
+    $dialog.TopMost         = $true
+    $dialog.FormBorderStyle = 'FixedDialog'
+    $dialog.MaximizeBox     = $false
+    $dialog.MinimizeBox     = $false
+
+    $label = New-Object System.Windows.Forms.Label
+    $label.Text     = "You were away for $awayMins minutes ($lockStr - $unlockStr).`nWhat were you doing?"
+    $label.Location = New-Object System.Drawing.Point(20, 15)
+    $label.Size     = New-Object System.Drawing.Size(390, 40)
+    $label.Font     = New-Object System.Drawing.Font("Segoe UI", 10)
+
+    $btnBreak = New-Object System.Windows.Forms.Button
+    $btnBreak.Text     = "Break"
+    $btnBreak.Location = New-Object System.Drawing.Point(20, 65)
+    $btnBreak.Size     = New-Object System.Drawing.Size(120, 40)
+    $btnBreak.Font     = New-Object System.Drawing.Font("Segoe UI", 9, [System.Drawing.FontStyle]::Bold)
+
+    $btnMeeting = New-Object System.Windows.Forms.Button
+    $btnMeeting.Text     = "Meeting"
+    $btnMeeting.Location = New-Object System.Drawing.Point(150, 65)
+    $btnMeeting.Size     = New-Object System.Drawing.Size(120, 40)
+    $btnMeeting.Font     = New-Object System.Drawing.Font("Segoe UI", 9)
+
+    $btnIgnore = New-Object System.Windows.Forms.Button
+    $btnIgnore.Text     = "Ignore"
+    $btnIgnore.Location = New-Object System.Drawing.Point(280, 65)
+    $btnIgnore.Size     = New-Object System.Drawing.Size(120, 40)
+    $btnIgnore.Font     = New-Object System.Drawing.Font("Segoe UI", 9)
+
+    # --- "Both" panel with slider ---
+    $btnBoth = New-Object System.Windows.Forms.Button
+    $btnBoth.Text     = "Both (split it)"
+    $btnBoth.Location = New-Object System.Drawing.Point(20, 115)
+    $btnBoth.Size     = New-Object System.Drawing.Size(120, 35)
+    $btnBoth.Font     = New-Object System.Drawing.Font("Segoe UI", 9)
+
+    # --- 50/50 button ---
+    $btnFiftyFifty = New-Object System.Windows.Forms.Button
+    $btnFiftyFifty.Text     = "50 / 50"
+    $btnFiftyFifty.Location = New-Object System.Drawing.Point(150, 115)
+    $btnFiftyFifty.Size     = New-Object System.Drawing.Size(80, 35)
+    $btnFiftyFifty.Font     = New-Object System.Drawing.Font("Segoe UI", 9)
+    $btnFiftyFifty.Visible  = $false
+
+    $splitPanel = New-Object System.Windows.Forms.Panel
+    $splitPanel.Location = New-Object System.Drawing.Point(20, 155)
+    $splitPanel.Size     = New-Object System.Drawing.Size(380, 75)
+    $splitPanel.Visible  = $false
+
+    $splitLabel = New-Object System.Windows.Forms.Label
+    $splitLabel.Location = New-Object System.Drawing.Point(0, 0)
+    $splitLabel.Size     = New-Object System.Drawing.Size(380, 20)
+    $splitLabel.Font     = New-Object System.Drawing.Font("Segoe UI", 9)
+
+    # Slider works in seconds for precision
+    $slider = New-Object System.Windows.Forms.TrackBar
+    $slider.Location = New-Object System.Drawing.Point(0, 22)
+    $slider.Size     = New-Object System.Drawing.Size(290, 30)
+    $slider.Minimum  = 0
+    $slider.Maximum  = $awaySecs
+    $slider.Value    = [math]::Floor($awaySecs / 2)
+    $slider.TickFrequency = [math]::Max(1, [math]::Floor($awaySecs / 20))
+
+    $btnConfirmSplit = New-Object System.Windows.Forms.Button
+    $btnConfirmSplit.Text     = "OK"
+    $btnConfirmSplit.Location = New-Object System.Drawing.Point(300, 22)
+    $btnConfirmSplit.Size     = New-Object System.Drawing.Size(70, 30)
+    $btnConfirmSplit.Font     = New-Object System.Drawing.Font("Segoe UI", 9, [System.Drawing.FontStyle]::Bold)
+
+    $updateSplitLabel = {
+        $brkMin = [math]::Round($slider.Value / 60, 1)
+        $mtgMin = [math]::Round(($awaySecs - $slider.Value) / 60, 1)
+        $splitLabel.Text = "Break: $brkMin min  |  Meeting: $mtgMin min"
+    }
+    & $updateSplitLabel
+
+    $slider.Add_ValueChanged({ & $updateSplitLabel })
+
+    $splitPanel.Controls.AddRange(@($splitLabel, $slider, $btnConfirmSplit))
+
+    # Result tracking
+    $script:awayResult = @{ Choice = "ignore"; BreakMinutes = 0 }
+
+    $btnBreak.Add_Click({
+        $script:awayResult = @{ Choice = "break"; BreakMinutes = 0 }
+        $dialog.Close()
+    })
+    $btnMeeting.Add_Click({
+        $script:awayResult = @{ Choice = "meeting"; BreakMinutes = 0 }
+        $dialog.Close()
+    })
+    $btnIgnore.Add_Click({
+        $script:awayResult = @{ Choice = "ignore"; BreakMinutes = 0 }
+        $dialog.Close()
+    })
+
+    $btnBoth.Add_Click({
+        $splitPanel.Visible    = $true
+        $btnFiftyFifty.Visible = $true
+        $dialog.Size = New-Object System.Drawing.Size(430, 310)
+    })
+
+    $btnFiftyFifty.Add_Click({
+        $half = [math]::Round($awaySecs / 60 / 2, 1)
+        $script:awayResult = @{ Choice = "both"; BreakMinutes = $half }
+        $dialog.Close()
+    })
+
+    $btnConfirmSplit.Add_Click({
+        $script:awayResult = @{ Choice = "both"; BreakMinutes = [math]::Round($slider.Value / 60, 1) }
+        $dialog.Close()
+    })
+
+    $dialog.Controls.AddRange(@($label, $btnBreak, $btnMeeting, $btnIgnore, $btnBoth, $btnFiftyFifty, $splitPanel))
+    $dialog.ShowDialog() | Out-Null
+
+    return $script:awayResult
 }
 
 # -- System tray icon --
@@ -82,6 +284,7 @@ $contextMenu.Items.Add("-")
 # --- Stop ---
 $stopItem = $contextMenu.Items.Add("Stop Reminders")
 $stopItem.Add_Click({
+    [Microsoft.Win32.SystemEvents]::remove_SessionSwitch($sessionSwitchHandler)
     $trayIcon.Visible = $false
     $trayIcon.Dispose()
     [System.Environment]::Exit(0)
@@ -102,9 +305,10 @@ $contextMenu.Add_Opening({
     # Line 2: total / working / break
     $totalElapsed  = (Get-Date) - $script:sessionStart
     $breakSpan     = [TimeSpan]::FromSeconds($script:totalBreakSeconds)
-    $workSpan      = $totalElapsed - $breakSpan
+    $meetingSpan   = [TimeSpan]::FromSeconds($script:totalMeetingSeconds)
+    $workSpan      = $totalElapsed - $breakSpan - $meetingSpan
     if ($workSpan.TotalSeconds -lt 0) { $workSpan = [TimeSpan]::Zero }
-    $timesItem.Text = "Total $(Format-Duration $totalElapsed)  |  Work $(Format-Duration $workSpan)  |  Break $(Format-Duration $breakSpan)"
+    $timesItem.Text = "W:$(Format-Duration $workSpan) B:$(Format-Duration $breakSpan) M:$(Format-Duration $meetingSpan) T:$(Format-Duration $totalElapsed)"
 })
 
 # -- Helper functions --
@@ -117,10 +321,9 @@ function Update-TrayTooltip {
 
     $totalElapsed = (Get-Date) - $script:sessionStart
     $breakSpan    = [TimeSpan]::FromSeconds($script:totalBreakSeconds)
-    $workSpan     = $totalElapsed - $breakSpan
+    $workSpan     = $totalElapsed - $breakSpan - [TimeSpan]::FromSeconds($script:totalMeetingSeconds)
     if ($workSpan.TotalSeconds -lt 0) { $workSpan = [TimeSpan]::Zero }
 
-    # NotifyIcon.Text is capped at 63 chars, so keep it compact
     $tip = "Break at $timeStr (${minLeft}m ${secLeft}s)`nW:$(Format-Duration $workSpan) B:$(Format-Duration $breakSpan) T:$(Format-Duration $totalElapsed)"
     if ($tip.Length -gt 63) { $tip = $tip.Substring(0, 63) }
     $trayIcon.Text = $tip
@@ -327,15 +530,21 @@ function Show-DailySummary {
     $snoozes     = 0
     $manuals     = 0
     $timedBreaks = 0
+    $awayBreaks  = 0
+    $awayMeetings = 0
+    $awayBoth    = 0
     $durations   = @()
 
     if (Test-Path $logFilePath) {
         $lines = Get-Content $logFilePath | Select-Object -Skip 1
         foreach ($line in $lines) {
             if ($line -match "^$today") {
-                if ($line -match ",break_taken,")  { $breaks++  }
-                if ($line -match ",break_manual,") { $manuals++ }
-                if ($line -match ",snooze,")       { $snoozes++ }
+                if ($line -match ",break_taken,")   { $breaks++   }
+                if ($line -match ",break_manual,")  { $manuals++  }
+                if ($line -match ",snooze,")        { $snoozes++  }
+                if ($line -match ",away_break,")    { $awayBreaks++ }
+                if ($line -match ",away_meeting,")  { $awayMeetings++ }
+                if ($line -match ",away_both,")     { $awayBoth++ }
                 if ($line -match ",break_ended,.*Duration:\s*([\d.]+)\s*min") {
                     $timedBreaks++
                     $durations += [double]$Matches[1]
@@ -344,28 +553,32 @@ function Show-DailySummary {
         }
     }
 
-    $totalBreaks   = $breaks + $manuals + $timedBreaks
+    $totalBreaks   = $breaks + $manuals + $timedBreaks + $awayBreaks + $awayBoth
     $expectedSlots = [math]::Floor(((Get-Date) - (Get-Date).Date).TotalMinutes / $breakEveryMinutes)
     if ($expectedSlots -lt 1) { $expectedSlots = 1 }
 
     # Session time stats
-    $totalElapsed = (Get-Date) - $script:sessionStart
-    $breakSpan    = [TimeSpan]::FromSeconds($script:totalBreakSeconds)
-    $workSpan     = $totalElapsed - $breakSpan
+    $totalElapsed  = (Get-Date) - $script:sessionStart
+    $breakSpan     = [TimeSpan]::FromSeconds($script:totalBreakSeconds)
+    $meetingSpan   = [TimeSpan]::FromSeconds($script:totalMeetingSeconds)
+    $workSpan      = $totalElapsed - $breakSpan - $meetingSpan
     if ($workSpan.TotalSeconds -lt 0) { $workSpan = [TimeSpan]::Zero }
 
-    $sep = "------------------------------"
+    $sep = "--------------------------------------"
 
     $msg  = "Today's Break Summary`n"
     $msg += "$sep`n"
     $msg += "Total time:          $(Format-Duration $totalElapsed)`n"
     $msg += "Working time:        $(Format-Duration $workSpan)`n"
     $msg += "Break time:          $(Format-Duration $breakSpan)`n"
+    $msg += "Meeting time:        $(Format-Duration $meetingSpan)`n"
     $msg += "$sep`n"
     $msg += "Breaks taken:        $totalBreaks / $expectedSlots expected`n"
     $msg += "  via dialog:        $breaks`n"
     $msg += "  via tray menu:     $manuals`n"
     $msg += "  timed breaks:      $timedBreaks`n"
+    $msg += "  away (lock):       $awayBreaks  (+$awayBoth split)`n"
+    $msg += "Meetings (lock):     $awayMeetings  (+$awayBoth split)`n"
     $msg += "Snoozes:             $snoozes`n"
 
     if ($timedBreaks -gt 0) {
@@ -374,7 +587,7 @@ function Show-DailySummary {
         $minMin     = [math]::Round(($durations | Measure-Object -Minimum).Minimum, 1)
         $maxMin     = [math]::Round(($durations | Measure-Object -Maximum).Maximum, 1)
         $msg += "$sep`n"
-        $msg += "Total break time:    $totalMin min`n"
+        $msg += "Total timed breaks:  $totalMin min`n"
         $msg += "Average break:       $avgMin min`n"
         $msg += "Shortest break:      $minMin min`n"
         $msg += "Longest break:       $maxMin min`n"
@@ -391,7 +604,7 @@ function Show-DailySummary {
 
     $summaryDialog = New-Object System.Windows.Forms.Form
     $summaryDialog.Text            = "Break Reminder - Daily Summary"
-    $summaryDialog.Size            = New-Object System.Drawing.Size(360, 350)
+    $summaryDialog.Size            = New-Object System.Drawing.Size(400, 400)
     $summaryDialog.StartPosition   = 'CenterScreen'
     $summaryDialog.TopMost         = $true
     $summaryDialog.FormBorderStyle = 'FixedDialog'
@@ -401,12 +614,12 @@ function Show-DailySummary {
     $lbl = New-Object System.Windows.Forms.Label
     $lbl.Text     = $msg
     $lbl.Location = New-Object System.Drawing.Point(20, 15)
-    $lbl.Size     = New-Object System.Drawing.Size(320, 250)
+    $lbl.Size     = New-Object System.Drawing.Size(360, 300)
     $lbl.Font     = New-Object System.Drawing.Font("Consolas", 9.5)
 
     $btnOk = New-Object System.Windows.Forms.Button
     $btnOk.Text     = "OK"
-    $btnOk.Location = New-Object System.Drawing.Point(140, 270)
+    $btnOk.Location = New-Object System.Drawing.Point(160, 320)
     $btnOk.Size     = New-Object System.Drawing.Size(70, 30)
     $btnOk.Add_Click({ $summaryDialog.Close() })
 
@@ -451,6 +664,7 @@ while (-not $script:shouldStop) {
 }
 
 # Clean exit
+[Microsoft.Win32.SystemEvents]::remove_SessionSwitch($sessionSwitchHandler)
 $trayIcon.Visible = $false
 $trayIcon.Dispose()
 exit
