@@ -1,6 +1,7 @@
 # Load assemblies FIRST
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
+
 # ===================== CONFIGURATION =====================
 $breakEveryMinutes  = 45
 $flashCount         = 4
@@ -8,35 +9,59 @@ $borderThickness    = 25
 $flashColor         = [System.Drawing.Color]::Red
 $logFilePath        = Join-Path $env:USERPROFILE "break_reminder_log.csv"
 # =========================================================
+
 # Initialise log file with header if it doesn't exist
 if (-not (Test-Path $logFilePath)) {
     "Timestamp,Event,Detail" | Out-File -FilePath $logFilePath -Encoding UTF8
 }
+
 function Write-BreakLog {
     param([string]$Event, [string]$Detail = "")
     $line = "{0},{1},{2}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), $Event, $Detail
     $line | Out-File -FilePath $logFilePath -Append -Encoding UTF8
 }
+
 # Track state
-$script:nextBreakTime    = (Get-Date).AddMinutes($breakEveryMinutes)
-$script:snoozeStreak     = 0
-$script:shouldStop       = $false
+$script:sessionStart        = Get-Date
+$script:totalBreakSeconds   = 0
+$script:nextBreakTime       = (Get-Date).AddMinutes($breakEveryMinutes)
+$script:snoozeStreak        = 0
+$script:shouldStop          = $false
+
+# -- Helper: format a TimeSpan as "Xh Ym" --
+function Format-Duration {
+    param([TimeSpan]$ts)
+    $h = [math]::Floor($ts.TotalHours)
+    $m = $ts.Minutes
+    if ($h -gt 0) { return "{0}h {1}m" -f $h, $m }
+    return "{0}m" -f $m
+}
+
 # -- System tray icon --
 $trayIcon = New-Object System.Windows.Forms.NotifyIcon
 $trayIcon.Icon    = [System.Drawing.SystemIcons]::Information
 $trayIcon.Visible = $true
+
 $contextMenu = New-Object System.Windows.Forms.ContextMenuStrip
-# --- Status line (disabled, just for display) ---
+
+# --- Status lines (disabled, just for display) ---
 $statusItem = $contextMenu.Items.Add("...")
 $statusItem.Enabled = $false
 $statusItem.Font = New-Object System.Drawing.Font("Consolas", 9)
+
+$timesItem = $contextMenu.Items.Add("...")
+$timesItem.Enabled = $false
+$timesItem.Font = New-Object System.Drawing.Font("Consolas", 9)
+
 $contextMenu.Items.Add("-")
+
 # --- Start break now ---
 $startBreakItem = $contextMenu.Items.Add("Start break now")
 $startBreakItem.Font = New-Object System.Drawing.Font("Segoe UI", 9, [System.Drawing.FontStyle]::Bold)
 $startBreakItem.Add_Click({
     Start-Break -Source "tray menu"
 })
+
 # --- I just took a break ---
 $breakTakenItem = $contextMenu.Items.Add("I just took a break")
 $breakTakenItem.Add_Click({
@@ -45,12 +70,15 @@ $breakTakenItem.Add_Click({
     Write-BreakLog "break_manual" "Reset via tray menu"
     $trayIcon.ShowBalloonTip(2000, "Break Reminder", "Timer reset. Next break in $breakEveryMinutes min.", [System.Windows.Forms.ToolTipIcon]::Info)
 })
+
 # --- Today's summary ---
 $summaryItem = $contextMenu.Items.Add("Today's summary")
 $summaryItem.Add_Click({
     Show-DailySummary
 })
+
 $contextMenu.Items.Add("-")
+
 # --- Stop ---
 $stopItem = $contextMenu.Items.Add("Stop Reminders")
 $stopItem.Add_Click({
@@ -58,16 +86,27 @@ $stopItem.Add_Click({
     $trayIcon.Dispose()
     [System.Environment]::Exit(0)
 })
+
 $trayIcon.ContextMenuStrip = $contextMenu
-# Update the status line every time the menu opens
+
+# Update the status lines every time the menu opens
 $contextMenu.Add_Opening({
+    # Line 1: next break countdown
     $remaining = $script:nextBreakTime - (Get-Date)
     if ($remaining.TotalSeconds -lt 0) { $remaining = [TimeSpan]::Zero }
     $minLeft = [math]::Floor($remaining.TotalMinutes)
     $secLeft = $remaining.Seconds
     $timeStr = $script:nextBreakTime.ToString("HH:mm")
     $statusItem.Text = "Next break: $timeStr  ($minLeft min $secLeft sec)"
+
+    # Line 2: total / working / break
+    $totalElapsed  = (Get-Date) - $script:sessionStart
+    $breakSpan     = [TimeSpan]::FromSeconds($script:totalBreakSeconds)
+    $workSpan      = $totalElapsed - $breakSpan
+    if ($workSpan.TotalSeconds -lt 0) { $workSpan = [TimeSpan]::Zero }
+    $timesItem.Text = "Total $(Format-Duration $totalElapsed)  |  Work $(Format-Duration $workSpan)  |  Break $(Format-Duration $breakSpan)"
 })
+
 # -- Helper functions --
 function Update-TrayTooltip {
     $remaining = $script:nextBreakTime - (Get-Date)
@@ -75,8 +114,18 @@ function Update-TrayTooltip {
     $minLeft  = [math]::Floor($remaining.TotalMinutes)
     $secLeft  = $remaining.Seconds
     $timeStr  = $script:nextBreakTime.ToString("HH:mm")
-    $trayIcon.Text = "Break at $timeStr ($minLeft min $secLeft sec left)"
+
+    $totalElapsed = (Get-Date) - $script:sessionStart
+    $breakSpan    = [TimeSpan]::FromSeconds($script:totalBreakSeconds)
+    $workSpan     = $totalElapsed - $breakSpan
+    if ($workSpan.TotalSeconds -lt 0) { $workSpan = [TimeSpan]::Zero }
+
+    # NotifyIcon.Text is capped at 63 chars, so keep it compact
+    $tip = "Break at $timeStr (${minLeft}m ${secLeft}s)`nW:$(Format-Duration $workSpan) B:$(Format-Duration $breakSpan) T:$(Format-Duration $totalElapsed)"
+    if ($tip.Length -gt 63) { $tip = $tip.Substring(0, 63) }
+    $trayIcon.Text = $tip
 }
+
 function Get-FlashParams {
     switch ($script:snoozeStreak) {
         0 { return @{ Count = $flashCount; Thickness = $borderThickness;    Color = [System.Drawing.Color]::Red;       Beep = $false } }
@@ -87,12 +136,14 @@ function Get-FlashParams {
         }
     }
 }
+
 function Flash-Screen {
     $params = Get-FlashParams
     $fCount     = $params.Count
     $fThickness = $params.Thickness
     $fColor     = $params.Color
     $fBeep      = $params.Beep
+
     $forms = @()
     foreach ($screen in [System.Windows.Forms.Screen]::AllScreens) {
         $form = New-Object System.Windows.Forms.Form
@@ -102,11 +153,13 @@ function Flash-Screen {
         $form.TransparencyKey = [System.Drawing.Color]::Lime
         $form.ShowInTaskbar   = $false
         $form.Bounds          = $screen.Bounds
+
         $form.Tag = @{
             ScreenBounds = $screen.Bounds
             Color        = $fColor
             Thickness    = $fThickness
         }
+
         $form.Add_Paint({
             param($s, $e)
             $tag  = $s.Tag
@@ -122,9 +175,11 @@ function Flash-Screen {
             $g.DrawRectangle($pen, $rect)
             $pen.Dispose()
         })
+
         $form.Show()
         $forms += $form
     }
+
     for ($i = 0; $i -lt $fCount; $i++) {
         if ($fBeep) { [Console]::Beep(1000, 100) }
         foreach ($f in $forms) { $f.Opacity = 1.0; $f.Refresh() }
@@ -134,9 +189,9 @@ function Flash-Screen {
     }
     foreach ($f in $forms) { $f.Close(); $f.Dispose() }
 }
+
 function Start-Break {
     param([string]$Source = "unknown")
-
     $breakStart = Get-Date
     Write-BreakLog "break_started" "Via $Source"
 
@@ -190,6 +245,9 @@ function Start-Break {
     $duration  = $breakEnd - $breakStart
     $durMins   = [math]::Round($duration.TotalMinutes, 1)
 
+    # Accumulate break time
+    $script:totalBreakSeconds += $duration.TotalSeconds
+
     Write-BreakLog "break_ended" "Duration: $durMins min (via $Source)"
 
     $script:nextBreakTime = (Get-Date).AddMinutes($breakEveryMinutes)
@@ -202,12 +260,14 @@ function Start-Break {
         [System.Windows.Forms.ToolTipIcon]::Info
     )
 }
+
 function Show-BreakDialog {
     param([int]$minutesWorked)
     $streakNote = ""
     if ($script:snoozeStreak -ge 2) {
         $streakNote = "`nYou've snoozed $($script:snoozeStreak) times in a row - take a break!"
     }
+
     $dialog = New-Object System.Windows.Forms.Form
     $dialog.Text            = "Break Reminder"
     $dialog.Size            = New-Object System.Drawing.Size(470, 180)
@@ -216,6 +276,7 @@ function Show-BreakDialog {
     $dialog.FormBorderStyle = 'FixedDialog'
     $dialog.MaximizeBox     = $false
     $dialog.MinimizeBox     = $false
+
     $label = New-Object System.Windows.Forms.Label
     $label.Text      = "Time for a break!`nYou've been working for $minutesWorked minutes.$streakNote"
     $label.Location  = New-Object System.Drawing.Point(20, 15)
@@ -247,6 +308,7 @@ function Show-BreakDialog {
     $btn10.Font     = New-Object System.Drawing.Font("Segoe UI", 9)
 
     $script:dialogResult = "break"
+
     $btnStartBreak.Add_Click({ $script:dialogResult = "startbreak"; $dialog.Close() })
     $btnBreak.Add_Click({      $script:dialogResult = "break";      $dialog.Close() })
     $btn5.Add_Click({          $script:dialogResult = "snooze5";    $dialog.Close() })
@@ -254,10 +316,13 @@ function Show-BreakDialog {
 
     $dialog.Controls.AddRange(@($label, $btnStartBreak, $btnBreak, $btn5, $btn10))
     $dialog.ShowDialog() | Out-Null
+
     return $script:dialogResult
 }
+
 function Show-DailySummary {
     $today = (Get-Date).ToString("yyyy-MM-dd")
+
     $breaks      = 0
     $snoozes     = 0
     $manuals     = 0
@@ -283,8 +348,19 @@ function Show-DailySummary {
     $expectedSlots = [math]::Floor(((Get-Date) - (Get-Date).Date).TotalMinutes / $breakEveryMinutes)
     if ($expectedSlots -lt 1) { $expectedSlots = 1 }
 
+    # Session time stats
+    $totalElapsed = (Get-Date) - $script:sessionStart
+    $breakSpan    = [TimeSpan]::FromSeconds($script:totalBreakSeconds)
+    $workSpan     = $totalElapsed - $breakSpan
+    if ($workSpan.TotalSeconds -lt 0) { $workSpan = [TimeSpan]::Zero }
+
     $sep = "------------------------------"
+
     $msg  = "Today's Break Summary`n"
+    $msg += "$sep`n"
+    $msg += "Total time:          $(Format-Duration $totalElapsed)`n"
+    $msg += "Working time:        $(Format-Duration $workSpan)`n"
+    $msg += "Break time:          $(Format-Duration $breakSpan)`n"
     $msg += "$sep`n"
     $msg += "Breaks taken:        $totalBreaks / $expectedSlots expected`n"
     $msg += "  via dialog:        $breaks`n"
@@ -315,7 +391,7 @@ function Show-DailySummary {
 
     $summaryDialog = New-Object System.Windows.Forms.Form
     $summaryDialog.Text            = "Break Reminder - Daily Summary"
-    $summaryDialog.Size            = New-Object System.Drawing.Size(360, 310)
+    $summaryDialog.Size            = New-Object System.Drawing.Size(360, 350)
     $summaryDialog.StartPosition   = 'CenterScreen'
     $summaryDialog.TopMost         = $true
     $summaryDialog.FormBorderStyle = 'FixedDialog'
@@ -325,20 +401,22 @@ function Show-DailySummary {
     $lbl = New-Object System.Windows.Forms.Label
     $lbl.Text     = $msg
     $lbl.Location = New-Object System.Drawing.Point(20, 15)
-    $lbl.Size     = New-Object System.Drawing.Size(320, 210)
+    $lbl.Size     = New-Object System.Drawing.Size(320, 250)
     $lbl.Font     = New-Object System.Drawing.Font("Consolas", 9.5)
 
     $btnOk = New-Object System.Windows.Forms.Button
     $btnOk.Text     = "OK"
-    $btnOk.Location = New-Object System.Drawing.Point(140, 230)
+    $btnOk.Location = New-Object System.Drawing.Point(140, 270)
     $btnOk.Size     = New-Object System.Drawing.Size(70, 30)
     $btnOk.Add_Click({ $summaryDialog.Close() })
 
     $summaryDialog.Controls.AddRange(@($lbl, $btnOk))
     $summaryDialog.ShowDialog() | Out-Null
 }
+
 # ===================== MAIN LOOP =====================
 Write-BreakLog "session_start" "Break every $breakEveryMinutes min"
+
 while (-not $script:shouldStop) {
     while ((Get-Date) -lt $script:nextBreakTime -and -not $script:shouldStop) {
         Start-Sleep -Seconds 1
@@ -346,8 +424,10 @@ while (-not $script:shouldStop) {
         [System.Windows.Forms.Application]::DoEvents()
     }
     if ($script:shouldStop) { break }
+
     Flash-Screen
     $response = Show-BreakDialog -minutesWorked $breakEveryMinutes
+
     switch ($response) {
         "startbreak" {
             Start-Break -Source "dialog"
@@ -369,6 +449,7 @@ while (-not $script:shouldStop) {
         }
     }
 }
+
 # Clean exit
 $trayIcon.Visible = $false
 $trayIcon.Dispose()
