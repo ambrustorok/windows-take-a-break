@@ -631,6 +631,7 @@ function Show-DailySummary {
 Write-BreakLog "session_start" "Break every $breakEveryMinutes min"
 
 while (-not $script:shouldStop) {
+    # Wait until next break time
     while ((Get-Date) -lt $script:nextBreakTime -and -not $script:shouldStop) {
         Start-Sleep -Seconds 1
         Update-TrayTooltip
@@ -638,28 +639,53 @@ while (-not $script:shouldStop) {
     }
     if ($script:shouldStop) { break }
 
-    Flash-Screen
-    $response = Show-BreakDialog -minutesWorked $breakEveryMinutes
+    # -- Escalating flash loop --
+    # Flash once, show dialog. If they snooze or ignore the dialog (close it),
+    # wait reflashIntervalSec, then flash twice, show dialog again, etc.
+    $flashRound = 1
 
-    switch ($response) {
-        "startbreak" {
-            Start-Break -Source "dialog"
+    :reminderLoop while ($true) {
+        Flash-Screen -FlashCount $flashRound
+
+        $response = Show-BreakDialog -minutesWorked $breakEveryMinutes
+
+        switch ($response) {
+            "startbreak" {
+                Start-Break -Source "dialog"
+                break reminderLoop
+            }
+            "break" {
+                $script:nextBreakTime = (Get-Date).AddMinutes($breakEveryMinutes)
+                $script:snoozeStreak  = 0
+                Write-BreakLog "break_taken" "Via dialog"
+                break reminderLoop
+            }
+            "snooze5" {
+                $script:nextBreakTime = (Get-Date).AddMinutes(5)
+                $script:snoozeStreak++
+                Write-BreakLog "snooze" "5 min (streak: $($script:snoozeStreak))"
+                break reminderLoop
+            }
+            "snooze10" {
+                $script:nextBreakTime = (Get-Date).AddMinutes(10)
+                $script:snoozeStreak++
+                Write-BreakLog "snooze" "10 min (streak: $($script:snoozeStreak))"
+                break reminderLoop
+            }
         }
-        "break" {
-            $script:nextBreakTime = (Get-Date).AddMinutes($breakEveryMinutes)
-            $script:snoozeStreak  = 0
-            Write-BreakLog "break_taken" "Via dialog"
+
+        # If we get here, user closed the dialog without picking an option (X button)
+        # Wait, then escalate
+        Write-BreakLog "reminder_dismissed" "Round $flashRound - dialog closed without action"
+        $flashRound++
+
+        $waitEnd = (Get-Date).AddSeconds($reflashIntervalSec)
+        while ((Get-Date) -lt $waitEnd -and -not $script:shouldStop) {
+            Start-Sleep -Seconds 1
+            Update-TrayTooltip
+            [System.Windows.Forms.Application]::DoEvents()
         }
-        "snooze5" {
-            $script:nextBreakTime = (Get-Date).AddMinutes(5)
-            $script:snoozeStreak++
-            Write-BreakLog "snooze" "5 min (streak: $($script:snoozeStreak))"
-        }
-        "snooze10" {
-            $script:nextBreakTime = (Get-Date).AddMinutes(10)
-            $script:snoozeStreak++
-            Write-BreakLog "snooze" "10 min (streak: $($script:snoozeStreak))"
-        }
+        if ($script:shouldStop) { break reminderLoop }
     }
 }
 
