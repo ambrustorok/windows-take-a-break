@@ -4,10 +4,10 @@ Add-Type -AssemblyName System.Drawing
 
 # ===================== CONFIGURATION =====================
 $breakEveryMinutes  = 45
-$flashCount         = 4
 $borderThickness    = 25
-$flashColor         = [System.Drawing.Color]::Red
 $logFilePath        = Join-Path $env:USERPROFILE "break_reminder_log.csv"
+$maxFlashCount      = 6          # cap so it never gets crazy
+$reflashIntervalSec = 60         # seconds between repeat flash rounds
 # =========================================================
 
 # Initialise log file with header if it doesn't exist
@@ -29,6 +29,7 @@ $script:nextBreakTime       = (Get-Date).AddMinutes($breakEveryMinutes)
 $script:snoozeStreak        = 0
 $script:shouldStop          = $false
 $script:lockTime            = $null
+$script:onBreak             = $false
 
 # -- Helper: format a TimeSpan as "Xh Ym" --
 function Format-Duration {
@@ -55,8 +56,8 @@ $sessionSwitchHandler = [Microsoft.Win32.SessionSwitchEventHandler]{
                 $lockTimeStr = $script:lockTime.ToString("HH:mm")
                 Write-BreakLog "screen_unlocked" "Away $awayMins min (locked at $lockTimeStr)"
 
-                # Only ask if away for more than 1 minute
-                if ($awaySeconds -ge 60) {
+                # Don't prompt if currently on a timed break or if away less than 1 minute
+                if (-not $script:onBreak -and $awaySeconds -ge 60) {
                     $result = Show-AwayDialog -LockTime $script:lockTime -UnlockTime $unlockTime
                     switch ($result.Choice) {
                         "break" {
@@ -70,7 +71,6 @@ $sessionSwitchHandler = [Microsoft.Win32.SessionSwitchEventHandler]{
                         }
                         "meeting" {
                             $script:totalMeetingSeconds += $awaySeconds
-                            # Don't reset break timer — they still need a break
                             Write-BreakLog "away_meeting" "Away time counted as meeting: $awayMins min"
                             $trayIcon.ShowBalloonTip(2000, "Break Reminder",
                                 "Welcome back! $awayMins min counted as meeting.",
@@ -94,6 +94,8 @@ $sessionSwitchHandler = [Microsoft.Win32.SessionSwitchEventHandler]{
                             Write-BreakLog "away_ignored" "Away $awayMins min - user chose to ignore"
                         }
                     }
+                } elseif ($script:onBreak) {
+                    Write-BreakLog "screen_unlocked_on_break" "Away $awayMins min - on timed break, no prompt"
                 }
                 $script:lockTime = $null
             }
@@ -302,7 +304,7 @@ $contextMenu.Add_Opening({
     $timeStr = $script:nextBreakTime.ToString("HH:mm")
     $statusItem.Text = "Next break: $timeStr  ($minLeft min $secLeft sec)"
 
-    # Line 2: total / working / break
+    # Line 2: total / working / break / meeting
     $totalElapsed  = (Get-Date) - $script:sessionStart
     $breakSpan     = [TimeSpan]::FromSeconds($script:totalBreakSeconds)
     $meetingSpan   = [TimeSpan]::FromSeconds($script:totalMeetingSeconds)
@@ -329,23 +331,11 @@ function Update-TrayTooltip {
     $trayIcon.Text = $tip
 }
 
-function Get-FlashParams {
-    switch ($script:snoozeStreak) {
-        0 { return @{ Count = $flashCount; Thickness = $borderThickness;    Color = [System.Drawing.Color]::Red;       Beep = $false } }
-        1 { return @{ Count = 6;           Thickness = $borderThickness+10; Color = [System.Drawing.Color]::OrangeRed; Beep = $false } }
-        2 { return @{ Count = 8;           Thickness = $borderThickness+20; Color = [System.Drawing.Color]::DarkRed;   Beep = $true  } }
-        default {
-              return @{ Count = 10;        Thickness = $borderThickness+30; Color = [System.Drawing.Color]::DarkRed;   Beep = $true  }
-        }
-    }
-}
-
 function Flash-Screen {
-    $params = Get-FlashParams
-    $fCount     = $params.Count
-    $fThickness = $params.Thickness
-    $fColor     = $params.Color
-    $fBeep      = $params.Beep
+    param([int]$FlashCount = 1)
+
+    if ($FlashCount -lt 1) { $FlashCount = 1 }
+    if ($FlashCount -gt $script:maxFlashCount) { $FlashCount = $script:maxFlashCount }
 
     $forms = @()
     foreach ($screen in [System.Windows.Forms.Screen]::AllScreens) {
@@ -359,8 +349,7 @@ function Flash-Screen {
 
         $form.Tag = @{
             ScreenBounds = $screen.Bounds
-            Color        = $fColor
-            Thickness    = $fThickness
+            Thickness    = $borderThickness
         }
 
         $form.Add_Paint({
@@ -368,7 +357,7 @@ function Flash-Screen {
             $tag  = $s.Tag
             $g    = $e.Graphics
             $t    = $tag.Thickness
-            $pen  = New-Object System.Drawing.Pen($tag.Color, $t)
+            $pen  = New-Object System.Drawing.Pen([System.Drawing.Color]::Red, $t)
             $rect = [System.Drawing.Rectangle]::new(
                 [int]($t / 2),
                 [int]($t / 2),
@@ -383,18 +372,22 @@ function Flash-Screen {
         $forms += $form
     }
 
-    for ($i = 0; $i -lt $fCount; $i++) {
-        if ($fBeep) { [Console]::Beep(1000, 100) }
+    for ($i = 0; $i -lt $FlashCount; $i++) {
         foreach ($f in $forms) { $f.Opacity = 1.0; $f.Refresh() }
-        Start-Sleep -Milliseconds 300
+        Start-Sleep -Milliseconds 400
         foreach ($f in $forms) { $f.Opacity = 0.0; $f.Refresh() }
-        Start-Sleep -Milliseconds 200
+        if ($i -lt ($FlashCount - 1)) {
+            Start-Sleep -Milliseconds 300
+        }
     }
+
     foreach ($f in $forms) { $f.Close(); $f.Dispose() }
 }
 
 function Start-Break {
     param([string]$Source = "unknown")
+
+    $script:onBreak = $true
     $breakStart = Get-Date
     Write-BreakLog "break_started" "Via $Source"
 
@@ -450,6 +443,7 @@ function Start-Break {
 
     # Accumulate break time
     $script:totalBreakSeconds += $duration.TotalSeconds
+    $script:onBreak = $false
 
     Write-BreakLog "break_ended" "Duration: $durMins min (via $Source)"
 
@@ -526,14 +520,14 @@ function Show-BreakDialog {
 function Show-DailySummary {
     $today = (Get-Date).ToString("yyyy-MM-dd")
 
-    $breaks      = 0
-    $snoozes     = 0
-    $manuals     = 0
-    $timedBreaks = 0
-    $awayBreaks  = 0
+    $breaks       = 0
+    $snoozes      = 0
+    $manuals      = 0
+    $timedBreaks  = 0
+    $awayBreaks   = 0
     $awayMeetings = 0
-    $awayBoth    = 0
-    $durations   = @()
+    $awayBoth     = 0
+    $durations    = @()
 
     if (Test-Path $logFilePath) {
         $lines = Get-Content $logFilePath | Select-Object -Skip 1
@@ -640,8 +634,6 @@ while (-not $script:shouldStop) {
     if ($script:shouldStop) { break }
 
     # -- Escalating flash loop --
-    # Flash once, show dialog. If they snooze or ignore the dialog (close it),
-    # wait reflashIntervalSec, then flash twice, show dialog again, etc.
     $flashRound = 1
 
     :reminderLoop while ($true) {
@@ -674,8 +666,7 @@ while (-not $script:shouldStop) {
             }
         }
 
-        # If we get here, user closed the dialog without picking an option (X button)
-        # Wait, then escalate
+        # User closed the dialog without picking an option (X button)
         Write-BreakLog "reminder_dismissed" "Round $flashRound - dialog closed without action"
         $flashRound++
 
